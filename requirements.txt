@@ -2,4 +2,5 @@ streamlit
 neo4j
 numpy
 pandas
+streamlit-autorefresh
 faiss-cpu
