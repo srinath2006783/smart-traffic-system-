@@ -1,5 +1,5 @@
 streamlit
-numpy
-networkx
-plotly
 neo4j
+numpy
+pandas
+faiss-cpu
