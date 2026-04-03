@@ -15,237 +15,154 @@ NEO4J_DB = "2ba57011"
 
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-st.set_page_config(layout="wide")
-st.title("🚦 Intelligent Traffic Control System")
+# ---------------- FAISS ----------------
+DIM = 4
+index = faiss.IndexFlatL2(DIM)
+vector_store = []
 
-WINDOW = 20
-MAX_QUEUE = 120
-
-SIM_INTERVAL = 1.0
-DB_INTERVAL = 5.0
-REFRESH_INTERVAL = st.slider("Refresh Speed", 1, 10, 4)
-
-# -----------------------------
-# CORE GRAPH (4 NODES)
-# -----------------------------
-nodes = ["T Nagar", "Guindy", "Velachery", "OMR Junction"]
-
-edges = [
-    ("T Nagar","Guindy"),
-    ("Guindy","Velachery"),
-    ("Velachery","OMR Junction"),
-    ("OMR Junction","Guindy")
+# ---------------- NODES ----------------
+NODES = [
+    "Guindy", "T Nagar", "Velachery", "Adyar",
+    "OMR Junction", "Tambaram", "Airport",
+    "Central", "Egmore", "Vadapalani"
 ]
 
-# adjacency weights (influence)
-W = {
-    ("T Nagar","Guindy"): 0.2,
-    ("Guindy","Velachery"): 0.3,
-    ("Velachery","OMR Junction"): 0.3,
-    ("OMR Junction","Guindy"): 0.2
-}
+# ---------------- INIT DB ----------------
+def init_db():
+    with driver.session() as session:
+        session.run("MATCH (n) DETACH DELETE n")
 
-G = nx.DiGraph()
-G.add_nodes_from(nodes)
-G.add_edges_from(edges)
-pos = nx.spring_layout(G, seed=42)
-
-# -----------------------------
-# STATE INIT
-# -----------------------------
-if "queues" not in st.session_state:
-    st.session_state.queues = {n: np.random.randint(20, 40) for n in nodes}
-
-if "history" not in st.session_state:
-    st.session_state.history = {n: [30]*WINDOW for n in nodes}
-
-if "signals" not in st.session_state:
-    st.session_state.signals = {n: 0.5 for n in nodes}
-
-if "last_update" not in st.session_state:
-    st.session_state.last_update = time.time()
-
-if "last_db_push" not in st.session_state:
-    st.session_state.last_db_push = time.time()
-
-# -----------------------------
-# MATHEMATICAL MODEL DISPLAY
-# -----------------------------
-st.subheader("📐 System Model")
-
-st.latex(r"Q_i(t+1) = Q_i(t) + A_i(t) + \sum_j w_{ji} Q_j(t) - S_i(t)")
-
-# -----------------------------
-# OPTIMIZATION (SIGNAL CONTROL)
-# -----------------------------
-total_queue = sum(st.session_state.queues.values())
-
-for node in nodes:
-    if total_queue > 0:
-        st.session_state.signals[node] = st.session_state.queues[node] / total_queue
-
-# -----------------------------
-# SIMULATION (REAL SYSTEM)
-# -----------------------------
-if time.time() - st.session_state.last_update > SIM_INTERVAL:
-    st.session_state.last_update = time.time()
-
-    newQ = {}
-
-    for node in nodes:
-        Q = st.session_state.queues[node]
-
-        # arrivals (stochastic input)
-        arrivals = np.random.poisson(4)
-
-        # influence from neighbors
-        influence = sum(
-            W.get((src,node),0) * st.session_state.queues[src]
-            for src, tgt in edges if tgt == node
-        )
-
-        # service based on optimized signal
-        service = st.session_state.signals[node] * 15
-
-        newQ[node] = max(0, min(MAX_QUEUE, Q + arrivals + influence - service))
-
-    st.session_state.queues = newQ
-
-    for node in nodes:
-        hist = st.session_state.history[node]
-        hist.append(newQ[node])
-        hist.pop(0)
-
-# -----------------------------
-# PREDICTION (TREND + MEAN)
-# -----------------------------
-predictions = {}
-
-for node in nodes:
-    series = st.session_state.history[node]
-
-    trend = series[-1] - series[-2]
-    avg = np.mean(series[-5:])
-
-    predictions[node] = avg + trend
-
-# -----------------------------
-# GRIDLOCK DETECTION
-# -----------------------------
-if all(q > 90 for q in st.session_state.queues.values()):
-    st.error("🚨 GRIDLOCK: Entire system saturated")
-
-# -----------------------------
-# PUSH TO NEO4J
-# -----------------------------
-def update_neo4j():
-    with driver.session(database=NEO4J_DB) as session:
-        for node in nodes:
+        for node in NODES:
             session.run("""
-            MERGE (n:Intersection {id:$id})
-            SET n.queue=$q
-            """, id=node, q=float(st.session_state.queues[node]))
+            CREATE (:Intersection {
+                id: $id,
+                queue: rand()*20,
+                trend: 0,
+                variance: 0
+            })
+            """, id=node)
 
-if time.time() - st.session_state.last_db_push > DB_INTERVAL:
-    st.session_state.last_db_push = time.time()
-    update_neo4j()
+        # Meaningful connections
+        edges = [
+            ("Guindy", "T Nagar"),
+            ("Guindy", "Velachery"),
+            ("Guindy", "Airport"),
+            ("T Nagar", "Central"),
+            ("Velachery", "Adyar"),
+            ("Adyar", "OMR Junction"),
+            ("Guindy", "Vadapalani"),
+            ("Vadapalani", "Egmore"),
+            ("Tambaram", "Airport")
+        ]
 
-# -----------------------------
-# GRAPH VISUAL
-# -----------------------------
-edge_traces = []
+        for a, b in edges:
+            session.run("""
+            MATCH (a:Intersection {id:$a}), (b:Intersection {id:$b})
+            MERGE (a)-[:CONNECTED_TO]->(b)
+            """, a=a, b=b)
 
-for src, tgt in edges:
-    q1 = st.session_state.queues[src]
-    q2 = st.session_state.queues[tgt]
+# ---------------- SIMULATION ----------------
+def update_traffic():
+    with driver.session() as session:
+        result = session.run("MATCH (n:Intersection) RETURN n.id AS id, n.queue AS q")
 
-    color = "red" if q1 > q2 else "gray"
-    width = 4 if q1 > q2 else 1
+        for record in result:
+            node = record["id"]
+            q = record["q"]
 
-    x0,y0 = pos[src]
-    x1,y1 = pos[tgt]
+            inflow = np.random.randint(0, 10)
+            outflow = np.random.randint(0, 8)
 
-    edge_traces.append(go.Scatter(
-        x=[x0,x1,None],
-        y=[y0,y1,None],
-        mode="lines",
-        line=dict(color=color,width=width)
-    ))
+            new_q = max(0, q + inflow - outflow)
 
-node_trace = go.Scatter(
-    x=[pos[n][0] for n in nodes],
-    y=[pos[n][1] for n in nodes],
-    text=[f"{n}<br>Q={st.session_state.queues[n]:.1f}" for n in nodes],
-    mode="markers+text",
-    textposition="top center",
-    marker=dict(size=25, color=list(st.session_state.queues.values()), colorscale="Reds", showscale=True)
-)
+            session.run("""
+            MATCH (n:Intersection {id:$id})
+            SET n.queue=$q,
+                n.trend=$trend,
+                n.variance=$var
+            """, id=node, q=new_q,
+                 trend=inflow-outflow,
+                 var=np.random.random())
 
-fig = go.Figure(data=edge_traces + [node_trace])
-st.plotly_chart(fig, use_container_width=True)
+# ---------------- FAISS LOGIC ----------------
+def update_faiss():
+    global vector_store
 
-# -----------------------------
-# INSIGHTS (NOT HARDCODED)
-# -----------------------------
-st.subheader("🚨 System Insights")
+    with driver.session() as session:
+        result = session.run("""
+        MATCH (n:Intersection)
+        RETURN n.queue AS q, n.trend AS t, n.variance AS v
+        """)
 
-for node in nodes:
-    q = st.session_state.queues[node]
-    pred = predictions[node]
+        for r in result:
+            vec = np.array([r["q"], r["t"], r["v"], 1], dtype="float32")
+            vector_store.append(vec)
 
-    if pred > 80:
-        st.error(f"{node} will become critical soon")
-    elif q > 60:
-        st.warning(f"{node} is currently congested")
-    else:
-        st.success(f"{node} is stable")
+            if len(vector_store) > 100:
+                vector_store.pop(0)
 
-# -----------------------------
-# BOTTLENECK DETECTION
-# -----------------------------
-st.subheader("🧠 Bottlenecks")
+    if len(vector_store) > 10:
+        index.reset()
+        index.add(np.array(vector_store))
 
-for node in nodes:
-    incoming = sum(st.session_state.queues[src] for src,tgt in edges if tgt == node)
-    outgoing = sum(st.session_state.queues[tgt] for src,tgt in edges if src == node)
+# ---------------- BOTTLENECK DETECTION ----------------
+def detect_bottlenecks():
+    alerts = []
 
-    if incoming > outgoing + 20:
-        st.error(f"{node} is restricting flow")
+    with driver.session() as session:
+        result = session.run("""
+        MATCH (a:Intersection)-[:CONNECTED_TO]->(b:Intersection)
+        WHERE a.queue > b.queue + 5
+        RETURN a.id AS from, b.id AS to, a.queue AS qa, b.queue AS qb
+        """)
 
-# -----------------------------
-# SIGNAL DECISIONS
-# -----------------------------
-st.subheader("🚦 Optimized Signal Allocation")
+        for r in result:
+            alerts.append(
+                f"🚨 Heavy traffic at {r['from']} → affecting {r['to']} "
+                f"(Queue: {int(r['qa'])} → {int(r['qb'])})"
+            )
 
-for node in nodes:
-    st.write(f"{node}: Green time = {st.session_state.signals[node]*100:.1f}%")
+    return alerts
 
-# -----------------------------
-# PREDICTION GRAPH
-# -----------------------------
-selected = st.selectbox("Inspect Node", nodes)
+# ---------------- CONTROL LOGIC ----------------
+def suggest_control():
+    suggestions = []
 
-fig_ts = go.Figure()
+    with driver.session() as session:
+        result = session.run("""
+        MATCH (n:Intersection)
+        WHERE n.queue > 30
+        RETURN n.id AS id, n.queue AS q
+        """)
 
-fig_ts.add_trace(go.Scatter(
-    y=st.session_state.history[selected],
-    mode="lines+markers",
-    name="Actual"
-))
+        for r in result:
+            suggestions.append(
+                f"🚦 Increase GREEN signal time at {r['id']} (Queue={int(r['q'])})"
+            )
 
-fig_ts.add_trace(go.Scatter(
-    y=[predictions[selected]]*len(st.session_state.history[selected]),
-    mode="lines",
-    name="Predicted"
-))
+    return suggestions
 
-st.plotly_chart(fig_ts, use_container_width=True)
+# ---------------- STREAMLIT ----------------
+st.title("🚦 Smart Traffic System (Neo4j + FAISS)")
 
-# -----------------------------
-# REFRESH
-# -----------------------------
-time.sleep(REFRESH_INTERVAL)
-st.rerun()
+if st.button("Initialize System"):
+    init_db()
+    st.success("System Initialized")
+
+update_traffic()
+update_faiss()
+
+alerts = detect_bottlenecks()
+controls = suggest_control()
+
+st.subheader("🚨 Live Traffic Alerts")
+for a in alerts:
+    st.error(a)
+
+st.subheader("🧠 Signal Control Suggestions")
+for c in controls:
+    st.warning(c)
+
+st.subheader("🔄 Auto Refresh")
+time.sleep(2)
+st.experimental_rerun()
