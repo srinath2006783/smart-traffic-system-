@@ -1,9 +1,8 @@
 import streamlit as st
 import numpy as np
-import networkx as nx
-import plotly.graph_objects as go
-from neo4j import GraphDatabase
 import time
+from neo4j import GraphDatabase
+import faiss
 
 # -----------------------------
 # NEO4J CONFIG
