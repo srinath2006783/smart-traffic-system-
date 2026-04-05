@@ -25,9 +25,10 @@ st_autorefresh(interval=1500, key="refresh")
 nodes = [f"N{i}" for i in range(NUM_NODES)]
 
 # ---------------- NEO4J ----------------
-NEO4J_URI = st.secrets["NEO4J_URI"]
-NEO4J_USER = st.secrets["NEO4J_USER"]
-NEO4J_PASSWORD = st.secrets["NEO4J_PASSWORD"]
+NEO4J_URI = "neo4j+s://2ba57011.databases.neo4j.io"
+NEO4J_USER = "2ba57011"
+NEO4J_PASSWORD = "MPg5aMmkFJnam_F2zhCVr5WzphPcj0L7GsVFVuUDAUQ"
+NEO4J_DB = "2ba57011"
 
 driver = GraphDatabase.driver(
     NEO4J_URI,
