@@ -12,7 +12,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # ---------------- CONFIG ----------------
 st.set_page_config(layout="wide")
-st.title("🚦 Semantic + Graph Traffic Intelligence")
+st.title("🚦 Optimized Semantic + Graph Traffic System")
 
 NUM_NODES = 12
 WINDOW = 20
@@ -20,7 +20,8 @@ MAX_QUEUE = 80
 ARRIVAL_RATE = 3
 SERVICE_RATE = 5
 
-st_autorefresh(interval=1500, key="refresh")
+# Slower refresh = smoother app
+st_autorefresh(interval=3000, key="refresh")
 
 nodes = [f"N{i}" for i in range(NUM_NODES)]
 
@@ -53,7 +54,7 @@ if "graph" not in st.session_state:
 G = st.session_state.graph
 pos = st.session_state.pos
 
-# ---------------- PUSH GRAPH TO NEO4J ----------------
+# ---------------- PUSH GRAPH (ONCE) ----------------
 def push_graph():
     with driver.session() as session:
         for node in nodes:
@@ -91,14 +92,19 @@ for node in nodes:
     if len(hist) > WINDOW:
         hist.pop(0)
 
-# ---------------- UPDATE NEO4J ----------------
+# ---------------- FAST NEO4J UPDATE ----------------
 def update_neo4j():
+    data = [
+        {"id": node, "q": float(st.session_state.queues[node])}
+        for node in nodes
+    ]
+
     with driver.session() as session:
-        for node in nodes:
-            session.run("""
-            MATCH (n:Intersection {id:$id})
-            SET n.queue=$q
-            """, id=node, q=float(st.session_state.queues[node]))
+        session.run("""
+        UNWIND $data AS row
+        MATCH (n:Intersection {id: row.id})
+        SET n.queue = row.q
+        """, data=data)
 
 update_neo4j()
 
@@ -127,12 +133,22 @@ def generate_descriptor(node, series):
 
 descriptors = [generate_descriptor(n, st.session_state.history[n]) for n in nodes]
 
-# ---------------- FAISS ----------------
-emb = model.encode(descriptors)
+# ---------------- CACHE EMBEDDINGS ----------------
+@st.cache_data(ttl=5)
+def compute_embeddings(desc):
+    return model.encode(desc)
+
+emb = compute_embeddings(tuple(descriptors))
 vectors = np.array(emb).astype("float32")
 
-index = faiss.IndexFlatL2(EMBED_DIM)
-index.add(vectors)
+# ---------------- CACHE FAISS ----------------
+@st.cache_data(ttl=5)
+def build_faiss(vectors):
+    index = faiss.IndexFlatL2(EMBED_DIM)
+    index.add(vectors)
+    return index
+
+index = build_faiss(vectors)
 
 # ---------------- GRAPH VIS ----------------
 edge_x, edge_y = [], []
@@ -174,7 +190,7 @@ if query:
     qvec = model.encode([query]).astype("float32")
     D, I = index.search(qvec, 5)
 
-    st.subheader("Matching Nodes (Semantic)")
+    st.subheader("Matching Nodes")
     matched_nodes = []
 
     for idx in I[0]:
@@ -183,8 +199,8 @@ if query:
         st.write(node)
         st.write(descriptors[idx])
 
-    # ---------------- NEO4J IMPACT ----------------
-    st.subheader("🔗 Impact Analysis (Graph Reasoning)")
+    # ---------------- GRAPH REASONING ----------------
+    st.subheader("🔗 Impact Analysis")
 
     with driver.session() as session:
         for node in matched_nodes:
@@ -194,10 +210,10 @@ if query:
             """, id=node)
 
             for r in result:
-                st.write(f"{node} may affect {r['neighbor']} (queue={r['q']})")
+                st.write(f"{node} → {r['neighbor']} (queue={r['q']})")
 
 # ---------------- BOTTLENECK ----------------
-st.subheader("🚨 Bottlenecks (Live Graph)")
+st.subheader("🚨 Bottlenecks")
 
 with driver.session() as session:
     result = session.run("""
