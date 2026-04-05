@@ -1,8 +1,13 @@
-streamlit
-neo4j
-numpy
-networkx
-plotly
-faiss-cpu
-sentence-transformers
-streamlit-autorefresh
+streamlit>=1.32.0
+numpy>=1.24.0
+networkx>=3.2
+plotly>=5.18.0
+pandas>=2.0.0
+
+# Core DB + Search
+neo4j>=5.18.0
+sentence-transformers>=2.6.0
+faiss-cpu>=1.8.0
+
+# Optional: auto-refresh
+streamlit-autorefresh>=1.0.1
