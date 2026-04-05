@@ -1,6 +1,8 @@
 streamlit
 neo4j
 numpy
-pandas
-streamlit-autorefresh
+networkx
+plotly
 faiss-cpu
+sentence-transformers
+streamlit-autorefresh
