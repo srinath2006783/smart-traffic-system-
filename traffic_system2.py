@@ -1,167 +1,209 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import streamlit as st
 import numpy as np
-import time
+import networkx as nx
+import plotly.graph_objects as go
 from neo4j import GraphDatabase
+from sentence_transformers import SentenceTransformer
 import faiss
+from streamlit_autorefresh import st_autorefresh
 
-# -----------------------------
-# NEO4J CONFIG
-# -----------------------------
-NEO4J_URI = "neo4j+s://2ba57011.databases.neo4j.io"
-NEO4J_USER = "2ba57011"
-NEO4J_PASSWORD = "MPg5aMmkFJnam_F2zhCVr5WzphPcj0L7GsVFVuUDAUQ"
-NEO4J_DB = "2ba57011"
+# ---------------- CONFIG ----------------
+st.set_page_config(layout="wide")
+st.title("🚦 Semantic + Graph Traffic Intelligence")
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+NUM_NODES = 12
+WINDOW = 20
+MAX_QUEUE = 80
+ARRIVAL_RATE = 3
+SERVICE_RATE = 5
 
-# ---------------- FAISS ----------------
-DIM = 4
-index = faiss.IndexFlatL2(DIM)
-vector_store = []
+st_autorefresh(interval=1500, key="refresh")
 
-# ---------------- NODES ----------------
-NODES = [
-    "Guindy", "T Nagar", "Velachery", "Adyar",
-    "OMR Junction", "Tambaram", "Airport",
-    "Central", "Egmore", "Vadapalani"
-]
+nodes = [f"N{i}" for i in range(NUM_NODES)]
 
-# ---------------- INIT DB ----------------
-def init_db():
+# ---------------- NEO4J ----------------
+NEO4J_URI = st.secrets["NEO4J_URI"]
+NEO4J_USER = st.secrets["NEO4J_USER"]
+NEO4J_PASSWORD = st.secrets["NEO4J_PASSWORD"]
+
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USER, NEO4J_PASSWORD)
+)
+
+# ---------------- MODEL ----------------
+@st.cache_resource
+def load_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+model = load_model()
+EMBED_DIM = 384
+
+# ---------------- GRAPH ----------------
+if "graph" not in st.session_state:
+    G_temp = nx.gnm_random_graph(NUM_NODES, NUM_NODES*2, directed=True)
+    mapping = {i: nodes[i] for i in range(NUM_NODES)}
+    st.session_state.graph = nx.relabel_nodes(G_temp, mapping)
+    st.session_state.pos = nx.spring_layout(st.session_state.graph, seed=42)
+
+G = st.session_state.graph
+pos = st.session_state.pos
+
+# ---------------- PUSH GRAPH TO NEO4J ----------------
+def push_graph():
     with driver.session() as session:
-        session.run("MATCH (n) DETACH DELETE n")
+        for node in nodes:
+            session.run("MERGE (n:Intersection {id:$id})", id=node)
 
-        for node in NODES:
-            session.run("""
-            CREATE (:Intersection {
-                id: $id,
-                queue: rand()*20,
-                trend: 0,
-                variance: 0
-            })
-            """, id=node)
-
-        # Meaningful connections
-        edges = [
-            ("Guindy", "T Nagar"),
-            ("Guindy", "Velachery"),
-            ("Guindy", "Airport"),
-            ("T Nagar", "Central"),
-            ("Velachery", "Adyar"),
-            ("Adyar", "OMR Junction"),
-            ("Guindy", "Vadapalani"),
-            ("Vadapalani", "Egmore"),
-            ("Tambaram", "Airport")
-        ]
-
-        for a, b in edges:
+        for edge in G.edges():
             session.run("""
             MATCH (a:Intersection {id:$a}), (b:Intersection {id:$b})
             MERGE (a)-[:CONNECTED_TO]->(b)
-            """, a=a, b=b)
+            """, a=edge[0], b=edge[1])
+
+if "graph_loaded" not in st.session_state:
+    push_graph()
+    st.session_state.graph_loaded = True
+
+# ---------------- STATE ----------------
+if "queues" not in st.session_state:
+    st.session_state.queues = {n: np.random.randint(0, 10) for n in nodes}
+
+if "history" not in st.session_state:
+    st.session_state.history = {n: list(np.random.randint(0, 10, WINDOW)) for n in nodes}
 
 # ---------------- SIMULATION ----------------
-def update_traffic():
+for node in nodes:
+    Q = st.session_state.queues[node]
+
+    arrivals = np.random.poisson(ARRIVAL_RATE)
+    service = SERVICE_RATE if np.random.rand() > 0.5 else 0
+
+    newQ = max(0, min(MAX_QUEUE, Q + arrivals - service))
+    st.session_state.queues[node] = newQ
+
+    hist = st.session_state.history[node]
+    hist.append(newQ)
+    if len(hist) > WINDOW:
+        hist.pop(0)
+
+# ---------------- UPDATE NEO4J ----------------
+def update_neo4j():
     with driver.session() as session:
-        result = session.run("MATCH (n:Intersection) RETURN n.id AS id, n.queue AS q")
-
-        for record in result:
-            node = record["id"]
-            q = record["q"]
-
-            inflow = np.random.randint(0, 10)
-            outflow = np.random.randint(0, 8)
-
-            new_q = max(0, q + inflow - outflow)
-
+        for node in nodes:
             session.run("""
             MATCH (n:Intersection {id:$id})
-            SET n.queue=$q,
-                n.trend=$trend,
-                n.variance=$var
-            """, id=node, q=new_q,
-                 trend=inflow-outflow,
-                 var=np.random.random())
+            SET n.queue=$q
+            """, id=node, q=float(st.session_state.queues[node]))
 
-# ---------------- FAISS LOGIC ----------------
-def update_faiss():
-    global vector_store
+update_neo4j()
+
+# ---------------- DESCRIPTORS ----------------
+def generate_descriptor(node, series):
+    Q = series[-1]
+    trend = series[-1] - series[-2] if len(series) > 1 else 0
+
+    if Q > 40:
+        level = "heavy congestion"
+    elif Q > 20:
+        level = "moderate traffic"
+    else:
+        level = "light traffic"
+
+    if trend > 2:
+        t = "rapidly increasing"
+    elif trend > 0:
+        t = "increasing"
+    elif trend < -2:
+        t = "rapidly decreasing"
+    else:
+        t = "stable"
+
+    return f"{node} has {level} and is {t}"
+
+descriptors = [generate_descriptor(n, st.session_state.history[n]) for n in nodes]
+
+# ---------------- FAISS ----------------
+emb = model.encode(descriptors)
+vectors = np.array(emb).astype("float32")
+
+index = faiss.IndexFlatL2(EMBED_DIM)
+index.add(vectors)
+
+# ---------------- GRAPH VIS ----------------
+edge_x, edge_y = [], []
+
+for edge in G.edges():
+    x0, y0 = pos[edge[0]]
+    x1, y1 = pos[edge[1]]
+    edge_x += [x0, x1, None]
+    edge_y += [y0, y1, None]
+
+node_x, node_y, node_color = [], [], []
+
+for node in nodes:
+    x, y = pos[node]
+    node_x.append(x)
+    node_y.append(y)
+    node_color.append(st.session_state.queues[node])
+
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines"))
+
+fig.add_trace(go.Scatter(
+    x=node_x,
+    y=node_y,
+    mode="markers",
+    marker=dict(size=15, color=node_color, colorscale="Reds", showscale=True),
+    text=nodes
+))
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ---------------- QUERY ----------------
+st.subheader("🔍 Semantic Traffic Query")
+
+query = st.text_input("Describe traffic condition")
+
+if query:
+    qvec = model.encode([query]).astype("float32")
+    D, I = index.search(qvec, 5)
+
+    st.subheader("Matching Nodes (Semantic)")
+    matched_nodes = []
+
+    for idx in I[0]:
+        node = nodes[idx]
+        matched_nodes.append(node)
+        st.write(node)
+        st.write(descriptors[idx])
+
+    # ---------------- NEO4J IMPACT ----------------
+    st.subheader("🔗 Impact Analysis (Graph Reasoning)")
 
     with driver.session() as session:
-        result = session.run("""
-        MATCH (n:Intersection)
-        RETURN n.queue AS q, n.trend AS t, n.variance AS v
-        """)
+        for node in matched_nodes:
+            result = session.run("""
+            MATCH (a:Intersection {id:$id})-[:CONNECTED_TO]->(b)
+            RETURN b.id AS neighbor, b.queue AS q
+            """, id=node)
 
-        for r in result:
-            vec = np.array([r["q"], r["t"], r["v"], 1], dtype="float32")
-            vector_store.append(vec)
+            for r in result:
+                st.write(f"{node} may affect {r['neighbor']} (queue={r['q']})")
 
-            if len(vector_store) > 100:
-                vector_store.pop(0)
+# ---------------- BOTTLENECK ----------------
+st.subheader("🚨 Bottlenecks (Live Graph)")
 
-    if len(vector_store) > 10:
-        index.reset()
-        index.add(np.array(vector_store))
+with driver.session() as session:
+    result = session.run("""
+    MATCH (a:Intersection)-[:CONNECTED_TO]->(b)
+    WHERE a.queue > b.queue + 5
+    RETURN a.id AS from, b.id AS to
+    """)
 
-# ---------------- BOTTLENECK DETECTION ----------------
-def detect_bottlenecks():
-    alerts = []
-
-    with driver.session() as session:
-        result = session.run("""
-        MATCH (a:Intersection)-[:CONNECTED_TO]->(b:Intersection)
-        WHERE a.queue > b.queue + 5
-        RETURN a.id AS from, b.id AS to, a.queue AS qa, b.queue AS qb
-        """)
-
-        for r in result:
-            alerts.append(
-                f"🚨 Heavy traffic at {r['from']} → affecting {r['to']} "
-                f"(Queue: {int(r['qa'])} → {int(r['qb'])})"
-            )
-
-    return alerts
-
-# ---------------- CONTROL LOGIC ----------------
-def suggest_control():
-    suggestions = []
-
-    with driver.session() as session:
-        result = session.run("""
-        MATCH (n:Intersection)
-        WHERE n.queue > 30
-        RETURN n.id AS id, n.queue AS q
-        """)
-
-        for r in result:
-            suggestions.append(
-                f"🚦 Increase GREEN signal time at {r['id']} (Queue={int(r['q'])})"
-            )
-
-    return suggestions
-
-# ---------------- STREAMLIT ----------------
-st.title("🚦 Smart Traffic System (Neo4j + FAISS)")
-
-if st.button("Initialize System"):
-    init_db()
-    st.success("System Initialized")
-
-update_traffic()
-update_faiss()
-
-alerts = detect_bottlenecks()
-controls = suggest_control()
-
-st.subheader("🚨 Live Traffic Alerts")
-for a in alerts:
-    st.error(a)
-
-st.subheader("🧠 Signal Control Suggestions")
-for c in controls:
-    st.warning(c)
-
-st.subheader("🔄 Auto Refresh")
-time.sleep(2)
-st.experimental_rerun()
+    for r in result:
+        st.error(f"{r['from']} → {r['to']} congestion")
